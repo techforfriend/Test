@@ -1,0 +1,189 @@
+name: Sideraven Android Build
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - sideraven
+    paths:
+      - "app/**"
+      - "automation/**"
+      - "android-components/**"
+      - "gradle/**"
+      - "plugins/**"
+      - ".github/workflows/sideraven-ci.yml"
+      - "build.gradle*"
+      - "settings.gradle*"
+      - "gradle.properties"
+      - "version.txt"
+      - ".gitmodules"
+
+  pull_request:
+    branches:
+      - main
+      - sideraven
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sideraven-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Sideraven Debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      # 1. Checkout source code
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      # 2. Setup Java
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 3. Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            automation/iceraven/setup_venv.sh
+
+      # 4. Restore Android Components if the ZIP upload
+      # did not preserve the Git submodule.
+      - name: Prepare Android Components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f .gitmodules ]]; then
+            echo "::error::Missing .gitmodules file."
+            exit 1
+          fi
+
+          if [[ ! -f android-components/plugins/config/settings.gradle \
+             && ! -f android-components/plugins/config/build.gradle.kts \
+             && ! -f android-components/plugins/config/build.gradle ]]; then
+
+            echo "Android Components is missing or incomplete."
+
+            rm -rf android-components
+
+            git clone \
+              --depth 1 \
+              https://github.com/akliuxingyuan/android-components.git \
+              android-components
+          fi
+
+          if [[ ! -f android-components/plugins/config/build.gradle.kts \
+             && ! -f android-components/plugins/config/build.gradle ]]; then
+            echo "::error::Android Components checkout is incomplete."
+            exit 1
+          fi
+
+          echo "Android Components directory is available."
+
+      # 5. Install Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 6. Install the NDK required by the project
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager --install "ndk;29.0.14206865"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo "autosignReleaseWithDebugKey="
+          } > local.properties
+
+      # 7. Prepare the source and required generated files
+      - name: Prepare Sideraven source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x \
+            automation/sideraven/prepare.sh \
+            automation/iceraven/patch_android_components.sh \
+            automation/iceraven/setup_venv.sh \
+            gradlew
+
+          ./automation/sideraven/prepare.sh --force
+
+      # 8. Configure Gradle caching
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: on-success
+
+      # 9. Verify the Gradle wrapper
+      - name: Validate Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --version
+
+      # 10. Build the debug APK
+      - name: Build Debug APK
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs="-Xms512m -Xmx5g -XX:MaxMetaspaceSize=1g"
+            -Dorg.gradle.workers.max=2
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            app:assembleForkDebug \
+            -Pkotlin.compiler.execution.strategy=in-process \
+            --stacktrace \
+            --no-daemon
+
+      # 11. Confirm the APK exists
+      - name: Verify APK output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="gradle/build/app/outputs/apk/forkDebug"
+
+          if [[ ! -d "$APK_DIR" ]]; then
+            echo "::error::APK output directory was not created."
+            exit 1
+          fi
+
+          find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print
+
+          if ! find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' \
+            -print -quit | grep -q .; then
+            echo "::error::No APK was generated."
+            exit 1
+          fi
+
+      # 12. Upload APK for download
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sideraven-debug-apk
+          path: gradle/build/app/outputs/apk/forkDebug/*.apk
+          if-no-files-found: error
+          retention-days: 7
